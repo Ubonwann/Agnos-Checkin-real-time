@@ -1,16 +1,27 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { FIELD_GROUPS, FIELDS } from "../../lib/fields";
 import { validateAll, validateField } from "../../lib/validation";
 import { usePatientSession } from "../../hooks/usePatientSession";
 import FormField from "./FormField";
 
+const REDIRECT_DELAY_MS = 1800;
+
 export default function PatientForm() {
+  const router = useRouter();
   const { data, setField, submit, submitted, connected, sessionId } = usePatientSession();
   const [touched, setTouched] = useState({});
   const [errors, setErrors] = useState({});
   const [attemptedSubmit, setAttemptedSubmit] = useState(false);
+
+  // Show the confirmation briefly, then send the patient back to the home page.
+  useEffect(() => {
+    if (!submitted) return;
+    const t = setTimeout(() => router.push("/"), REDIRECT_DELAY_MS);
+    return () => clearTimeout(t);
+  }, [submitted, router]);
 
   function handleChange(fieldId, value) {
     setField(fieldId, value);
@@ -50,6 +61,7 @@ export default function PatientForm() {
         <p className="mt-2 text-sm text-slate-500">
           Thanks, {data.firstName || "there"}. A staff member has your details and will call you shortly.
         </p>
+        <p className="mt-6 text-xs text-slate-400">Taking you back to the home page&hellip;</p>
       </div>
     );
   }
