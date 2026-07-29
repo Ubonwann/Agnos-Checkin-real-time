@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { v4 as uuidv4 } from "uuid";
-import { getSocket } from "../lib/socketClient";
 import { EMPTY_PATIENT_DATA } from "../lib/fields";
 
 const STORAGE_KEY = "agnos:sessionId";
@@ -18,6 +17,16 @@ function readOrCreateSessionId() {
   return id;
 }
 
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Request to ${path} failed`);
+  return res.json();
+}
+
 export function usePatientSession() {
   const [sessionId, setSessionId] = useState(null);
   const [data, setData] = useState(EMPTY_PATIENT_DATA);
@@ -25,34 +34,51 @@ export function usePatientSession() {
   const [connected, setConnected] = useState(false);
   const pendingRef = useRef(null);
   const throttleTimer = useRef(null);
+  const dataRef = useRef(data);
+  dataRef.current = data;
 
   useEffect(() => {
     setSessionId(readOrCreateSessionId());
   }, []);
 
+  // Join (or resume) the session on mount, and tell the server we've left
+  // if the tab closes or navigates away — this replaces the socket.io
+  // "disconnect" event, which doesn't exist once there's no persistent
+  // connection to lose.
   useEffect(() => {
     if (!sessionId) return;
-    const socket = getSocket();
+    let cancelled = false;
 
-    function join() {
-      socket.emit("patient:join", { sessionId, data: {} });
-      setConnected(true);
+    post("/api/patient/join", { sessionId, data: {} })
+      .then(() => {
+        if (!cancelled) setConnected(true);
+      })
+      .catch(() => {
+        if (!cancelled) setConnected(false);
+      });
+
+    function handleLeave() {
+      const payload = JSON.stringify({ sessionId });
+      navigator.sendBeacon?.(
+        "/api/patient/leave",
+        new Blob([payload], { type: "application/json" })
+      );
     }
 
-    if (socket.connected) join();
-    socket.on("connect", join);
-    socket.on("disconnect", () => setConnected(false));
-
+    window.addEventListener("pagehide", handleLeave);
     return () => {
-      socket.off("connect", join);
+      cancelled = true;
+      window.removeEventListener("pagehide", handleLeave);
     };
   }, [sessionId]);
 
   function flush() {
     if (!pendingRef.current || !sessionId) return;
-    const socket = getSocket();
-    socket.emit("patient:update", { sessionId, data: pendingRef.current });
+    const payload = pendingRef.current;
     pendingRef.current = null;
+    post("/api/patient/update", { sessionId, data: payload }).catch(() => {
+      setConnected(false);
+    });
   }
 
   function setField(fieldId, value) {
@@ -73,8 +99,7 @@ export function usePatientSession() {
       clearTimeout(throttleTimer.current);
       throttleTimer.current = null;
     }
-    const socket = getSocket();
-    socket.emit("patient:submit", { sessionId, data });
+    post("/api/patient/submit", { sessionId, data: dataRef.current }).catch(() => {});
     setSubmitted(true);
   }
 

@@ -1,49 +1,74 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { getSocket } from "../lib/socketClient";
+import { useEffect, useRef, useState } from "react";
+import { getPusherClient, STAFF_CHANNEL, UPDATE_EVENT } from "../lib/pusherClient";
+
+const INACTIVITY_MS = 12_000; // no updates for this long -> show as "idle"
+
+function deriveStatus(session) {
+  if (session.status === "filling" && Date.now() - session.lastActivity > INACTIVITY_MS) {
+    return "idle";
+  }
+  return session.status;
+}
 
 export function useStaffSessions() {
-  const [sessions, setSessions] = useState({});
+  const [sessions, setSessions] = useState([]);
   const [connected, setConnected] = useState(false);
+  // Raw (server) sessions, keyed by id. Display state is derived from this
+  // on every render/tick, since "idle" is no longer pushed by the server.
+  const rawRef = useRef({});
+
+  function commit() {
+    const list = Object.values(rawRef.current)
+      .map((s) => ({ ...s, status: deriveStatus(s) }))
+      .sort((a, b) => a.createdAt - b.createdAt);
+    setSessions(list);
+  }
 
   useEffect(() => {
-    const socket = getSocket();
+    let cancelled = false;
 
-    function join() {
-      socket.emit("staff:join");
+    fetch("/api/staff/sessions")
+      .then((res) => res.json())
+      .then((list) => {
+        if (cancelled) return;
+        const map = {};
+        for (const s of list) map[s.sessionId] = s;
+        rawRef.current = map;
+        commit();
+      })
+      .catch(() => {});
+
+    const pusher = getPusherClient();
+    const channel = pusher.subscribe(STAFF_CHANNEL);
+
+    function onSubscribed() {
       setConnected(true);
     }
-
-    function onInit(list) {
-      const map = {};
-      for (const s of list) map[s.sessionId] = s;
-      setSessions(map);
-    }
-
-    function onUpdate(session) {
-      setSessions((prev) => ({ ...prev, [session.sessionId]: session }));
-    }
-
-    function onDisconnect() {
+    function onError() {
       setConnected(false);
     }
+    function onUpdate(session) {
+      rawRef.current = { ...rawRef.current, [session.sessionId]: session };
+      commit();
+    }
 
-    if (socket.connected) join();
-    socket.on("connect", join);
-    socket.on("staff:init", onInit);
-    socket.on("staff:patient_update", onUpdate);
-    socket.on("disconnect", onDisconnect);
+    channel.bind("pusher:subscription_succeeded", onSubscribed);
+    channel.bind("pusher:subscription_error", onError);
+    channel.bind(UPDATE_EVENT, onUpdate);
+
+    // Nothing pushes "idle" transitions anymore, so re-derive display status
+    // once a second purely from lastActivity, without hitting the network.
+    const tick = setInterval(commit, 1000);
 
     return () => {
-      socket.off("connect", join);
-      socket.off("staff:init", onInit);
-      socket.off("staff:patient_update", onUpdate);
-      socket.off("disconnect", onDisconnect);
+      cancelled = true;
+      clearInterval(tick);
+      channel.unbind_all();
+      pusher.unsubscribe(STAFF_CHANNEL);
     };
   }, []);
 
-  const list = Object.values(sessions).sort((a, b) => a.createdAt - b.createdAt);
-
-  return { sessions: list, connected };
+  return { sessions, connected };
 }

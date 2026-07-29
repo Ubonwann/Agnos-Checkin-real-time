@@ -4,13 +4,19 @@
 
 ```
 agnos-patient-system/
-├── server.js                     # Custom Node server: boots Next.js + attaches Socket.io
 ├── app/
 │   ├── layout.js                 # Root layout, loads fonts, sets global background/text color
 │   ├── globals.css               # Tailwind directives + a few base rules (focus ring, reduced motion)
 │   ├── page.js                   # Landing page (links to /patient and /staff)
 │   ├── patient/page.js           # Patient route — renders <PatientForm />
-│   └── staff/page.js             # Staff dashboard route — live grid of patient cards
+│   ├── staff/page.js             # Staff dashboard route — live grid of patient cards
+│   └── api/
+│       ├── patient/
+│       │   ├── join/route.js     # POST — create/resume a session
+│       │   ├── update/route.js   # POST — merge a field-level update
+│       │   ├── submit/route.js   # POST — mark a session submitted
+│       │   └── leave/route.js    # POST — mark a session left (sent via sendBeacon)
+│       └── staff/sessions/route.js # GET — initial snapshot for the dashboard
 ├── components/
 │   ├── patient/
 │   │   ├── PatientForm.jsx       # Grouped form, validation wiring, submit + success state
@@ -19,25 +25,28 @@ agnos-patient-system/
 │       ├── PatientCard.jsx       # One patient's live data + "just changed" flash highlight
 │       └── StatusBadge.jsx       # Filling in / Idle / Submitted / Left, with the pulse dot
 ├── hooks/
-│   ├── usePatientSession.js      # Session id, form state, throttled socket emits
-│   └── useStaffSessions.js       # Joins the staff room, keeps a live map of all sessions
+│   ├── usePatientSession.js      # Session id, form state, throttled POSTs to the API routes
+│   └── useStaffSessions.js       # Initial fetch + Pusher subscription, keeps a live map of all sessions
 ├── lib/
 │   ├── fields.js                 # Single source of truth for form fields (id/label/type/group/required)
 │   ├── validation.js             # validateField / validateAll, built from lib/fields.js
-│   ├── socketClient.js           # Shared Socket.io client singleton (browser side)
+│   ├── pusherClient.js           # Shared Pusher client singleton (browser side)
 │   └── realtime/
-│       ├── store.js              # In-memory session store (server side)
-│       └── socketServer.js       # Socket.io event handlers, wires store <-> broadcasts
+│       ├── store.js              # Upstash Redis-backed session store (server side)
+│       └── pusherServer.js       # Publishes session updates to the staff channel
 ├── tailwind.config.js            # Design tokens (colors, fonts, pulse/sweep keyframes)
 └── docs/DEVELOPMENT.md           # This file
 ```
 
-**Why a custom server instead of plain `next dev`/API routes?** Socket.io
-needs a raw HTTP server to attach to and upgrade connections on. Next's App
-Router doesn't expose that server directly, so `server.js` creates one,
-hands page requests to Next's request handler, and gives Socket.io the same
-server instance. Everything else about the app (routing, React Server
-Components, styling) is unmodified Next.js.
+**Why API routes + Pusher instead of a custom Socket.io server?** The app
+originally ran a custom Node server so Socket.io could hold long-lived
+WebSocket connections. That doesn't work on Vercel, where functions are
+short-lived and don't share memory across invocations. This version uses
+plain Next.js API routes for writes, [Upstash Redis](https://upstash.com)
+(REST-based, so no persistent connection needed) as the shared store, and
+[Pusher Channels](https://pusher.com/channels) as a managed pub/sub layer
+for the server -> staff-dashboard push. The result deploys on Vercel like
+any ordinary Next.js app — see the README's deployment section for setup.
 
 ## 2. Design
 
@@ -82,14 +91,15 @@ element and kept quiet everywhere else.
   errors (via `lib/validation.js`), and submit handling. It delegates the
   actual "talk to the server" concerns to `usePatientSession`.
 - **`usePatientSession.js`** is the only place that knows about session ids
-  and the socket protocol from the patient's side: it creates/reads the
-  session id, throttles outgoing `patient:update` events (200ms) so fast
-  typing doesn't flood the socket, and exposes a plain `setField`/`submit`
+  and the API routes from the patient's side: it creates/reads the session
+  id, throttles outgoing `POST /api/patient/update` calls (200ms) so fast
+  typing doesn't flood the network, and exposes a plain `setField`/`submit`
   API to the form.
-- **`useStaffSessions.js`** is the mirror on the staff side: joins the
-  `staff` room, receives the initial snapshot, and folds incoming
-  `staff:patient_update` events into a `{ sessionId: session }` map that
-  the dashboard renders as a sorted list.
+- **`useStaffSessions.js`** is the mirror on the staff side: fetches the
+  initial snapshot from `GET /api/staff/sessions`, subscribes to the Pusher
+  `staff-dashboard` channel, and folds incoming `patient-update` events into
+  a `{ sessionId: session }` map that the dashboard renders as a sorted
+  list.
 - **`PatientCard.jsx`** diffs the incoming data against the previous
   render (via a ref) to briefly highlight only the field that changed,
   rather than flashing the whole card on every keystroke.
@@ -99,54 +109,59 @@ element and kept quiet everywhere else.
 
 ## 4. Real-time synchronization flow
 
-Transport: **Socket.io**, one shared server instance created in
-`server.js` and configured in `lib/realtime/socketServer.js`. Session data
-lives in `lib/realtime/store.js`, a `Map` keyed by session id — no
-database, since the store only needs to survive the process, not a
-restart.
+Transport: **Pusher Channels** for server -> browser push, plain **fetch**
+for browser -> server writes. Session data lives in `lib/realtime/store.js`,
+an Upstash Redis hash keyed by session id — REST-based, so it's reachable
+from stateless serverless functions and survives across invocations.
 
 **Patient side**
 
 1. On mount, `usePatientSession` reads (or creates) a `sessionId` from
-   `sessionStorage` and emits `patient:join` once the socket connects.
+   `sessionStorage` and `POST`s it to `/api/patient/join`.
 2. Every keystroke updates local React state immediately (so typing never
    feels laggy) and queues the change. Queued changes are flushed as a
-   single `patient:update` event at most every 200ms — a light throttle,
-   not a debounce, so the staff view still updates *while* the patient is
-   typing rather than only after they pause.
-3. On submit, any pending update is flushed immediately, then a
-   `patient:submit` event is sent with the full record.
+   single `POST /api/patient/update` at most every 200ms — a light
+   throttle, not a debounce, so the staff view still updates *while* the
+   patient is typing rather than only after they pause.
+3. On submit, any pending update is flushed immediately, then
+   `POST /api/patient/submit` is sent with the full record.
+4. On tab close/navigation, a `pagehide` listener fires
+   `navigator.sendBeacon("/api/patient/leave", ...)` — the closest
+   serverless equivalent of a socket "disconnect" event.
 
 **Server side**
 
-4. `store.js` merges incoming data into the session, stamps
-   `lastActivity`, and sets `status: "filling"` (or `"submitted"` on
-   submit). `socketServer.js` then re-broadcasts the updated session to
-   everyone in the `staff` room via `staff:patient_update`.
-5. A 4-second sweep interval checks every in-progress session: if
-   `lastActivity` is more than ~12s old, status flips to `"idle"` and that
-   change is broadcast too — so a patient view flips to idle even without
-   a new keystroke to trigger it.
-6. On socket disconnect, an unsubmitted session is marked `"left"` (a
-   dropped tab or connection), which the staff dashboard filters out of
-   its default view.
+5. Each API route merges incoming data into the session via `store.js`
+   (stamping `lastActivity`, setting `status: "filling"` / `"submitted"` /
+   `"left"` as appropriate), then calls `pusherServer.js`'s
+   `publishSessionUpdate`, which triggers a `patient-update` event on the
+   `staff-dashboard` Pusher channel.
+6. There's no server-side sweep interval (serverless functions can't run a
+   background timer between requests), so `"idle"` isn't a stored status —
+   it's derived. `store.js` just keeps `lastActivity` up to date on every
+   write.
 
 **Staff side**
 
-7. `useStaffSessions` joins the `staff` room and receives `staff:init`
-   (a full snapshot of current sessions) once, then applies every
-   subsequent `staff:patient_update` as an in-place update to its local
-   map — no polling, no manual refresh.
+7. `useStaffSessions` fetches `GET /api/staff/sessions` once for the
+   initial snapshot, then subscribes to the `staff-dashboard` Pusher
+   channel and applies every `patient-update` event as an in-place update
+   to its local map.
+8. A 1-second local interval re-derives each session's *displayed* status
+   from `lastActivity` (flipping `"filling"` -> `"idle"` after ~12s) purely
+   client-side — no network call, so a patient going idle shows up on the
+   staff view even without a new event to trigger it.
 
 ```
-Patient types  ──▶ usePatientSession (throttle 200ms) ──▶ patient:update
+Patient types  ──▶ usePatientSession (throttle 200ms) ──▶ POST /api/patient/update
                                                                 │
                                                                 ▼
-                                              lib/realtime/store.js (merge + stamp)
+                                              lib/realtime/store.js (Upstash: merge + stamp)
                                                                 │
                                                                 ▼
-                                          io.to("staff").emit(staff:patient_update)
+                                        pusherServer.js: trigger("staff-dashboard", "patient-update")
                                                                 │
                                                                 ▼
                                     useStaffSessions ──▶ PatientCard re-renders
+                                        (+ 1s local tick derives idle/left display state)
 ```

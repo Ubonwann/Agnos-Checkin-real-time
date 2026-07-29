@@ -13,15 +13,18 @@ screen as they type it — no refresh, no polling delay.
 
 | Layer               | Choice                                   |
 | -------------------- | ----------------------------------------- |
-| Framework            | Next.js 14 (App Router)                   |
+| Framework            | Next.js 14 (App Router, standard serverless deploy — no custom server) |
 | Styling              | Tailwind CSS                              |
-| Real-time            | Socket.io (server attached to a custom Node HTTP server) |
-| State                | React hooks, in-memory server-side store  |
+| Real-time            | [Pusher Channels](https://pusher.com/channels) — API routes publish, the staff dashboard subscribes |
+| Session store         | [Upstash Redis](https://upstash.com) (REST-based, so it works from serverless functions) |
+| State                | React hooks                               |
 
-No database is used — session data lives in server memory, which is enough
-for a live intake queue and keeps the assignment self-contained. See
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the reasoning and how you'd
-swap in persistence.
+Patient field updates go `browser -> POST /api/patient/update -> Redis` and
+are then broadcast over Pusher to every open staff dashboard. There's no
+long-lived server process and no in-memory state, so this runs natively on
+Vercel. "Idle" status (no typing for ~12s) is derived on the client from a
+`lastActivity` timestamp instead of a server-side sweep, since serverless
+functions can't run a background timer between requests.
 
 ---
 
@@ -50,23 +53,68 @@ npm run start
 
 ---
 
-## Deployment notes
+## Deployment notes (Vercel)
 
-This app uses a **custom Node server** (`server.js`) that runs Next.js and
-Socket.io together on one long-lived HTTP server. That matters for hosting:
+This app runs on plain Next.js API routes — no custom server — so it
+deploys on Vercel like any standard Next.js app. It needs two external
+services, both with generous free tiers:
 
-- **Works well:** Render, Railway, Heroku, Fly.io, a VM, or any host that
-  runs a persistent Node process. These are the recommended targets — set
-  the start command to `npm run build && npm run start`.
-- **Vercel:** Vercel's functions are serverless/short-lived and don't hold
-  persistent WebSocket connections or a shared in-memory store across
-  invocations, so the custom server as written won't behave correctly there.
-  To deploy on Vercel specifically, swap the transport for something built
-  for serverless (Socket.io's Redis adapter + a separate always-on socket
-  host, or a managed real-time service like Pusher/Ably), or fall back to
-  Socket.io's long-polling only. That swap is isolated to
-  `lib/realtime/socketServer.js` and `lib/socketClient.js` — nothing in the
-  UI layer needs to change.
+1. **Pusher Channels** — real-time push from the server to the staff
+   dashboard.
+   - Create an app at [dashboard.pusher.com](https://dashboard.pusher.com).
+   - From "App Keys" you'll need: `app_id`, `key`, `secret`, `cluster`.
+
+2. **Upstash Redis** — the session store (survives across serverless
+   invocations, unlike an in-memory `Map`).
+   - Easiest path: in the Vercel dashboard, go to your project ->
+     **Storage** -> **Marketplace Database Providers** -> add **Upstash**.
+     This sets `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` for
+     you automatically.
+   - Or create a database directly at
+     [console.upstash.com](https://console.upstash.com) and copy the REST
+     URL/token yourself.
+
+### Environment variables
+
+Set these in Vercel (Project Settings -> Environment Variables) — see
+`.env.example` for the full list:
+
+| Variable | Where it's used |
+| --- | --- |
+| `PUSHER_APP_ID`, `PUSHER_KEY`, `PUSHER_SECRET`, `PUSHER_CLUSTER` | server-side, to publish events |
+| `NEXT_PUBLIC_PUSHER_KEY`, `NEXT_PUBLIC_PUSHER_CLUSTER` | client-side, to subscribe (must be `NEXT_PUBLIC_` to reach the browser) |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | server-side, session storage |
+
+### Steps
+
+```bash
+npm i -g vercel   # if you don't have it
+vercel login
+vercel            # first deploy, links the project
+vercel env add PUSHER_APP_ID
+vercel env add PUSHER_KEY
+vercel env add PUSHER_SECRET
+vercel env add PUSHER_CLUSTER
+vercel env add NEXT_PUBLIC_PUSHER_KEY
+vercel env add NEXT_PUBLIC_PUSHER_CLUSTER
+# skip the two UPSTASH_ vars if you used the Marketplace integration above
+vercel env add UPSTASH_REDIS_REST_URL
+vercel env add UPSTASH_REDIS_REST_TOKEN
+vercel --prod     # deploy with the env vars in place
+```
+
+Or connect the GitHub repo at [vercel.com/new](https://vercel.com/new) and
+add the same environment variables in the project settings before the first
+deploy — either way works.
+
+Locally, copy `.env.example` to `.env.local` and fill in the same values
+before running `npm run dev`.
+
+### Other hosts
+
+Render, Railway, Fly.io, or any host running a persistent Node process also
+still work fine with this same Pusher/Redis-based code — the API routes and
+hooks don't care whether the process is long-lived or serverless.
 
 ---
 
